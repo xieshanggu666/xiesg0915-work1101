@@ -22,6 +22,11 @@
 内置标准/严格/宽松三套预设，也可用 JSON 配置文件或命令行 `--set` 单项调整，
 每次报告（Excel「判定阈值」表、JSON、平面图标注、控制台）都会注明本次使用的阈值方案。
 
+支持**多模型批量核查与项目质量看板**（`batch` 子命令）：一次纳入项目下
+多个单体 IFC，按项目 / 单体 / 楼层汇总问题分布、净面积与门窗规格指标，
+按批次留存结果形成趋势对比，并由可配置的放行门禁在质量不达标时阻断放行，
+详见下文「多模型批量核查与项目质量看板」。
+
 结果支持：
 
 - **点击问题定位构件**：GUI 中点击问题列表，三维视图高亮对应构件并缩放到该位置；
@@ -76,6 +81,77 @@ python -m ifc_audit.cli gui
 | `sample_三维标注.png` | 三维轴测标注图（无 GPU 环境自动用 matplotlib 渲染） |
 | `sample_结果.json` | 机器可读的完整结果（含门窗明细与门窗表） |
 
+## 多模型批量核查与项目质量看板
+
+一次纳入一个项目的**多个单体 IFC**（文件 / 目录 / 多路径混传均可），
+按 **项目 → 单体 → 楼层** 三级汇总问题分布、净面积与门窗规格指标；
+每批结果按项目**留存快照**，自动与上一批次形成趋势对比；
+放行规则（质量门禁）不达标时以**退出码 3 阻断放行**，可直接挂 CI。
+
+```bash
+# 批量核查目录下全部单体（自动发现 .ifc/.ifcxml/.ifczip）
+python -m ifc_audit.cli batch path/to/ifc目录/ --project 花园小区一期 \
+    --label "v1首次提模" -o output/batch/
+
+# 多个文件 / 目录混传
+python -m ifc_audit.cli batch 1号楼.ifc 2号楼.ifc 地库/ --project XX项目
+
+# 竣工审查用严格门禁；方案阶段用宽松门禁；--no-gate 只统计不阻断
+python -m ifc_audit.cli batch ifc目录/ --project XX --gate-profile strict
+python -m ifc_audit.cli batch ifc目录/ --project XX --no-gate
+
+# 生成带中文说明的门禁配置模板，单项放行规则也可 --gate-set 覆盖
+python -m ifc_audit.cli init-gate gate.json
+python -m ifc_audit.cli batch ifc目录/ --project XX \
+    --gate-config gate.json --gate-set unit_max_warnings=20
+
+# 不导出每个单体的 Excel/平面图（只出批次报告，批量更快）
+python -m ifc_audit.cli batch ifc目录/ --project XX --no-unit-reports
+
+# 查看项目历次批次趋势（控制台），-o 同时导出趋势图
+python -m ifc_audit.cli trend --project 花园小区一期 -o output/trend.png
+```
+
+退出码：`0`=核查完成且门禁通过（准予放行）；`2`=配置 / 参数错误；
+`3`=**门禁不达标，已阻断放行**；核查阈值沿用 `--profile/--config/--set`。
+
+### 输出文件
+
+| 文件 | 内容 |
+| --- | --- |
+| `<项目>_批次核查报告_<批次号>.xlsx` | 8 张表：批次概览、**放行判定**、单体汇总、楼层汇总、问题分布（单体×问题类型）、门窗规格汇总（跨单体门窗表）、趋势对比、阈值与门禁 |
+| `<项目>_质量看板_<批次号>.png` | 项目质量看板：KPI 卡片、各单体问题堆叠、问题类型分布、净面积/不闭合房间、楼层问题、门窗异常/未归属、门窗规格构成、批次趋势与门禁未通过项清单 |
+| `<项目>_批次结果_<批次号>.json` | 机器可读的完整批次结果（含门禁逐条判定与趋势增量） |
+| `单体报告/<单体>_*` | 每个成功核查单体的单模型 Excel / CSV / 平面标注图（`--with-3d` 含三维图），格式与 `audit` 子命令一致 |
+| `batch_history/<项目>/batches/*.json` | 按项目归档的**批次快照**，供后续批次趋势对比（`--history` 可改目录） |
+
+### 放行门禁规则
+
+门禁分两级逐规则判定，全部通过才放行（结果写入 Excel「放行判定」表与看板）：
+
+- **单体级**（任一单体不达标即阻断）：错误数、警告数、每千 m² 错误数、
+  围护不闭合房间数与占比、未归属门窗数、尺寸异常门窗数与占比、重复构件组数；
+- **项目级**：错误总数、重复构件组总数、净面积为 0 房间数、
+  最少纳入单体数（`min_units`，防止漏传文件）；
+- **批次完整性**：存在无法解析的 IFC 默认直接阻断（`allow_failed_files=true` 可放开）。
+
+| 门禁预设 | 适用场景 | 单体错误 | 不闭合房间占比 | 异常门窗占比 | 重复构件组 |
+| --- | --- | --- | --- | --- | --- |
+| `default` 标准 | 施工图模型常规放行 | 0 | 5% | 5% | 0 |
+| `strict` 严格 | 竣工审查 | 0 | 2% | 2% | 0（警告数也受限） |
+| `loose` 宽松 | 方案阶段粗模 | ≤5 | 10% | 10% | ≤3 |
+| `none` 不设门禁 | 仅统计体检 | 不限制 | 不限制 | 不限制 | 不限制 |
+
+上限类规则取 `-1` 即关闭该条；占比字段单位为 `%`，布尔字段取 `true/false`。
+
+### 批次趋势
+
+每次 `batch` 都会把精简快照留存到 `<history>/<项目名>/batches/`，
+下次同项目核查时自动取上一批次对比：八项核心指标（问题总数 / 错误 / 警告 /
+重复构件组 / 净面积 / 不闭合房间 / 未归属门窗 / 尺寸异常门窗）的增减量、
+单体级错误变化、新增与缺失单体；看板趋势图按全部历史批次绘制，
+阻断批次红底标注 `BLOCKED`。
+
 ## 图形界面
 
 `python -m ifc_audit.cli gui` 打开窗口：
@@ -110,6 +186,37 @@ for row in model.opening_schedule:
 
 report.export_excel(model, "out/报告.xlsx")
 report.export_annotated_plan(model, "out/标注图.png")
+```
+
+批量核查 / 看板 / 门禁（Python API）：
+
+```python
+from ifc_audit.batch import run_batch_with_config, attach_trend, save_batch_snapshot
+from ifc_audit import batch_report
+
+batch = run_batch_with_config(
+    ["ifc/1号楼.ifc", "ifc/2号楼.ifc"],
+    project="花园小区一期", label="v1提模",
+    threshold_profile="default",          # 核查阈值：与 audit 一致
+    gate_profile="default",               # 放行门禁
+    gate_overrides={"unit_max_warnings": 20})
+
+for u in batch.units:                     # 单体汇总
+    print(u.name, u.errors, "错误", u.total_net_area, "m²",
+          "不闭合房间", u.rooms_open, "异常门窗", u.opening_anomaly)
+for s in batch.storeys:                   # 单体×楼层汇总
+    print(s.unit, s.storey, s.net_area, s.errors)
+
+print(batch.gate_passed)                  # True=放行，False=阻断
+for r in batch.gate_results:              # 逐条门禁判定
+    if not r.passed:
+        print("[阻断]", r.scope, r.message)
+
+attach_trend(batch, "output/batch_history")   # 附加与上一批次的趋势对比
+save_batch_snapshot(batch, "output/batch_history")
+batch_report.export_batch_excel(batch, "out/批次报告.xlsx")
+batch_report.export_dashboard(batch, "out/质量看板.png")
+batch_report.export_batch_json(batch, "out/批次结果.json")
 ```
 
 三维定位（桌面环境）：
@@ -248,6 +355,14 @@ python -m ifc_audit.cli audit output/sample.ifc -o output/
 1 处 150mm 墙段缺口与对应房间围护缺口、1 个面积偏差房间、1 个无声明面积房间、
 1 樘 300mm 宽异常小窗、1 樘游离门与 1 樘游离窗（未归属任何房间）。
 
+可用多个样例 IFC 体验批量核查与门禁阻断（会退出码 3）：
+
+```bash
+python tools/make_sample_ifc.py /tmp/proj/1号楼.ifc
+python tools/make_sample_ifc.py /tmp/proj/2号楼.ifc
+python -m ifc_audit.cli batch /tmp/proj --project 示例项目
+```
+
 ## 模块结构
 
 ```
@@ -257,14 +372,17 @@ ifc_audit/
   analytic.py    参数化 IfcExtrudedAreaSolid 轮廓解析
   extract.py     IFC 提取墙/门/窗/房间
   thresholds.py  判定阈值：预设 / 配置文件 / 命令行覆盖
+  gate.py        放行门禁：规则 / 预设 / 配置解析 / 模板导出
   checks.py      重复构件、自由端、墙段缺口、房间围护
   rooms.py       房间净面积清单
   openings.py    门窗规格清单（门窗表 / 异常 / 未归属）
+  batch.py       多模型批量核查、项目/单体/楼层聚合、门禁判定、批次快照与趋势
+  batch_report.py 批次 Excel / 项目质量看板 PNG / 批次 JSON / 趋势图
   report.py      Excel / CSV / 平面标注图
   viewer.py      PyVista 三维查看器 + matplotlib 三维回退
   viewer_win.py  独立进程 PyVista 窗口
   gui.py         Tkinter 图形界面
-  cli.py         命令行入口
+  cli.py         命令行入口（audit / batch / trend / init-gate / gui）
   pipeline.py    流程编排
 tools/
   make_sample_ifc.py  样例模型生成
