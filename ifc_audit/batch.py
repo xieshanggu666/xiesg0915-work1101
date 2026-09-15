@@ -235,6 +235,77 @@ def discover_ifc_files(paths: list[str]) -> list[str]:
                   key=lambda f: _natural_key(os.path.basename(f)))
 
 
+def _unit_base_name(file_path: str) -> str:
+    """单体默认名：去掉 IFC 后缀的文件名。"""
+    return os.path.splitext(os.path.basename(file_path))[0]
+
+
+def unique_unit_names(files: list[str]) -> dict[str, str]:
+    """为一批 IFC 文件生成不重名的单体名。
+
+    不同目录下存在同名文件时，单体名会带父目录消歧
+    （如 ``A区/楼A.ifc`` 与 ``B区/楼A.ifc`` -> ``A区-楼A``、``B区-楼A``）。
+    同一基名的一组重名文件统一带上相同级数的父目录，保证命名规整；
+    若候选名与其它单体（或组内文件）冲突，则整组再向上多带一级；
+    到根目录仍冲突时追加序号兜底。返回 ``{绝对路径: 单体名}``。
+    """
+    result: dict[str, str] = {}
+    used: set[str] = set()
+
+    def _take(path, candidate) -> bool:
+        if candidate not in used:
+            used.add(candidate)
+            result[path] = candidate
+            return True
+        return False
+
+    def _candidate(path: str, base: str, level: int) -> str:
+        parts = []
+        cur = os.path.dirname(path)
+        for _ in range(level):
+            parent = os.path.basename(cur)
+            if parent:
+                parts.append(parent)
+            nxt = os.path.dirname(cur)
+            if nxt == cur:  # 已到文件系统根
+                break
+            cur = nxt
+        return "-".join(parts[::-1] + [base]) if parts else base
+
+    by_base: dict[str, list[str]] = {}
+    for fp in files:
+        by_base.setdefault(_unit_base_name(fp), []).append(fp)
+
+    # 不重名的基名先占用文件名
+    duplicate_groups = []
+    for base, paths in by_base.items():
+        if len(paths) == 1:
+            _take(paths[0], base)
+        else:
+            duplicate_groups.append((base, sorted(paths)))
+
+    # 重名组：从 1 级父目录开始整组尝试，冲突则整组加深一级
+    for base, paths in duplicate_groups:
+        level = 1
+        while True:
+            candidates = {fp: _candidate(fp, base, level) for fp in paths}
+            values = list(candidates.values())
+            if len(set(values)) == len(values) and not (set(values) & used):
+                for fp, cand in candidates.items():
+                    _take(fp, cand)
+                break
+            # 所有路径都已取到根目录仍无法区分，序号兜底
+            if all(os.path.dirname(os.path.dirname(fp))
+                   == os.path.dirname(fp) for fp in paths):
+                for fp in paths:
+                    idx = 2
+                    while not _take(fp, f"{base}-{idx}"):
+                        idx += 1
+                break
+            level += 1
+    return result
+
+
 def _storey_label(storey: str) -> str:
     return storey or "(未分层)"
 
@@ -504,6 +575,8 @@ def run_batch(paths: list[str],
     files = discover_ifc_files(paths)
     if not files:
         raise FileNotFoundError("指定路径下没有找到 IFC 文件")
+    # 不同目录下的同名文件需要消歧，保证单体名在批次内唯一
+    unit_names = unique_unit_names(files)
 
     if gate is None:
         gate, gate_provenance = DEFAULT_GATE, GateProvenance()
@@ -515,7 +588,7 @@ def run_batch(paths: list[str],
     units: list[UnitResult] = []
     n = len(files)
     for idx, fp in enumerate(files):
-        name = os.path.splitext(os.path.basename(fp))[0]
+        name = unit_names[fp]
         base_pct = int(idx / n * 100)
         end_pct = int((idx + 1) / n * 100)
         report(base_pct, f"[{idx + 1}/{n}] 正在核查单体 {name} …")
@@ -530,7 +603,8 @@ def run_batch(paths: list[str],
             units.append(_aggregate_unit(name, fp, model))
         except Exception as exc:  # 单体失败不拖垮整批
             units.append(UnitResult(
-                name=name, file_path=fp, ok=False, error=f"{type(exc).__name__}: {exc}"))
+                name=name, file_path=fp, ok=False,
+                error=f"{type(exc).__name__}: {exc}"))
 
     all_storeys = [s for u in units for s in u.storeys]
     totals = _project_totals(units)

@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.make_sample_ifc import make_sample  # noqa: E402
 from ifc_audit.batch import (  # noqa: E402
     run_batch, run_batch_with_config, attach_trend, save_batch_snapshot,
-    load_project_history, discover_ifc_files,
+    load_project_history, discover_ifc_files, unique_unit_names,
 )
 from ifc_audit.gate import (  # noqa: E402
     for_gate_profile, resolve_gate, parse_gate_set_items, GateConfigError,
@@ -245,6 +245,54 @@ def run() -> int:
         dens_fails = [r for r in gd.gate_results
                       if not r.passed and r.key == "unit_max_errors_per_1000m2"]
         check(bool(dens_fails), "错误密度规则按每千平方米评估")
+
+        # ---- 不同目录下的同名 IFC：单体名消歧，结论不串、报告不覆盖 ----
+        dup_dir_a = os.path.join(td, "A区")
+        dup_dir_b = os.path.join(td, "B区")
+        os.makedirs(dup_dir_a)
+        os.makedirs(dup_dir_b)
+        same_a = os.path.join(dup_dir_a, "楼A.ifc")
+        same_b = os.path.join(dup_dir_b, "楼A.ifc")
+        make_sample(same_a)
+        make_sample(same_b)
+
+        dup_batch = run_batch_with_config(
+            [dup_dir_a, dup_dir_b], project="重名测试", gate_profile="default")
+        dup_names = [u.name for u in dup_batch.units]
+        check(len(dup_names) == 2 and len(set(dup_names)) == 2,
+              f"同名文件单体名唯一（实际 {dup_names}）")
+        check(set(dup_names) == {"A区-楼A", "B区-楼A"},
+              f"单体名带父目录消歧（实际 {sorted(dup_names)}）")
+        # 文件路径各自保留，没有互相覆盖
+        paths = {u.name: u.file_path for u in dup_batch.units}
+        check(os.path.dirname(paths["A区-楼A"]).endswith("A区")
+              and os.path.dirname(paths["B区-楼A"]).endswith("B区"),
+              "两个单体仍分别指向各自目录的文件")
+        # 门禁判定按消歧后的单体名分别成行，不互相合并
+        unit_scopes = {r.scope for r in dup_batch.gate_results
+                       if r.level == "unit"}
+        check(unit_scopes == {"A区-楼A", "B区-楼A"},
+              f"门禁逐条判定的单体范围互不相同（实际 {sorted(unit_scopes)}）")
+        # 单体汇总每行的结论只能命中自己那一行（旧 bug 会两行都取到同组判定）
+        from openpyxl import load_workbook
+        dup_xlsx = batch_report.export_batch_excel(
+            dup_batch, os.path.join(td, "dup.xlsx"))
+        wb_dup = load_workbook(dup_xlsx)
+        ws_dup = wb_dup["单体汇总"]
+        name_col = [(r[0].value, r[20].value) for r in ws_dup.iter_rows(
+            min_row=2, max_row=3)]
+        check({n for n, _ in name_col} == {"A区-楼A", "B区-楼A"},
+              f"单体汇总两行名称独立（实际 {name_col}）")
+        check(all(v == "不通过" for _, v in name_col),
+              f"两行结论各自独立判定，不串结论（实际 {name_col}）")
+        # 导出单体报告：同名文件不能互相覆盖
+        from ifc_audit.cli import _export_unit_reports
+        dup_out = os.path.join(td, "dup_out")
+        _export_unit_reports(dup_batch, dup_out, True, False)
+        for fn in ("A区-楼A_核查报告.xlsx", "B区-楼A_核查报告.xlsx",
+                   "A区-楼A_标注平面图.png", "B区-楼A_标注平面图.png"):
+            check(os.path.exists(os.path.join(dup_out, "单体报告", fn)),
+                  f"单体报告未互相覆盖：{fn}")
 
     print()
     if failures:

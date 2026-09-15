@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 from .pipeline import audit_ifc, audit_ifc_with_config
@@ -214,14 +215,27 @@ def _print_batch_summary(batch) -> None:
                            else "⛔ 不予放行（质量门禁阻断）"))
 
 
+def _safe_unit_filename(name: str) -> str:
+    """单体名 -> 可安全作为文件名的字符串（去掉路径分隔符等非法字符）。"""
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip("_") or "unit"
+
+
 def _export_unit_reports(batch, out_dir, quiet, with_3d) -> None:
     """为每个成功核查的单体导出单模型 Excel/CSV/平面图（可选三维图）。"""
     sub = os.path.join(out_dir, "单体报告")
     os.makedirs(sub, exist_ok=True)
+    used_names: set[str] = set()
     for u in batch.units:
         if u.model is None:
             continue
-        base = u.name
+        # 不同目录同名单体已在批量入口消歧；这里再做一次文件名防御，绝不覆盖
+        base = _safe_unit_filename(u.name)
+        if base in used_names:
+            i = 2
+            while f"{base}-{i}" in used_names:
+                i += 1
+            base = f"{base}-{i}"
+        used_names.add(base)
         report.export_excel(u.model, os.path.join(sub, f"{base}_核查报告.xlsx"))
         report.export_issues_csv(u.model, os.path.join(sub, f"{base}_问题清单.csv"))
         report.export_rooms_csv(u.model, os.path.join(sub, f"{base}_房间净面积.csv"))
